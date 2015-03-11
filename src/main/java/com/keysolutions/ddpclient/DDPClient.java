@@ -24,12 +24,18 @@ import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Observable;
+import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
+
+import main.common.meteorDdpClient.UserAuthenticator;
+import main.common.meteorDdpClient.DDPClient.CONNSTATE;
 
 import org.java_websocket.WebSocket.READYSTATE;
 import org.java_websocket.client.DefaultSSLWebSocketClientFactory;
@@ -100,6 +106,7 @@ public class DDPClient extends Observable {
         Disconnected,
         Connected,
         Closed,
+        Reconnecting,
     };
     private CONNSTATE mConnState;
     /** current command ID */
@@ -114,7 +121,13 @@ public class DDPClient extends Observable {
     private boolean mConnectionStarted;
     /** Google GSON object */
     private final Gson mGson = new Gson();
-
+    /** If true, it will reconnect on each dc detected*/
+    private boolean reconnectOnDc;
+    /** A list of pendingMessages to send out to the Meteor server once connected */
+    Queue<String> pendingMessageQueue = new ConcurrentLinkedQueue<String>();    
+    private boolean isWebSocketConnectionOpened = false;
+    /** AuthToken from meteor once authenticated */
+    private String authToken;
     /**
      * Instantiates a Meteor DDP client for the Meteor server located at the
      * supplied IP and port (note: running Meteor locally will typically have a
@@ -126,8 +139,9 @@ public class DDPClient extends Observable {
      * @param useSSL Whether to use SSL for websocket encryption
      * @throws URISyntaxException URI error
      */
-    public DDPClient(String meteorServerIp, Integer meteorServerPort, boolean useSSL)
+    public DDPClient(String meteorServerIp, Integer meteorServerPort, boolean useSSL, boolean reconnectOnDc)
             throws URISyntaxException {
+    	setReconnectOnDc(reconnectOnDc);
         initWebsocket(meteorServerIp, meteorServerPort, useSSL);
     }
     
@@ -143,10 +157,19 @@ public class DDPClient extends Observable {
      *            - Port of Meteor server, if left null it will default to 3000
      * @throws URISyntaxException URI error
      */
-    public DDPClient(String meteorServerIp, Integer meteorServerPort)
+    public DDPClient(String meteorServerIp, Integer meteorServerPort, boolean reconnectOnDc)
             throws URISyntaxException {
+    	setReconnectOnDc(reconnectOnDc);
         initWebsocket(meteorServerIp, meteorServerPort, false);
     }
+    
+	public boolean isReconnectOnDc() {
+		return reconnectOnDc;
+	}
+
+	public void setReconnectOnDc(boolean reconnectOnDc) {
+		this.reconnectOnDc = reconnectOnDc;
+	}
     
     /**
      * Initializes a websocket connection
@@ -233,6 +256,7 @@ public class DDPClient extends Observable {
      */
     private void connectionOpened() {
         log.trace("WebSocket connection opened");
+        isWebSocketConnectionOpened = true;
         // reply to Meteor server with connection confirmation message ({"msg":
         // "connect"})
         Map<String, Object> connectMsg = new HashMap<String, Object>();
@@ -241,10 +265,32 @@ public class DDPClient extends Observable {
         connectMsg.put(DdpMessageField.SUPPORT,
                 new String[] { DDP_PROTOCOL_VERSION });
         send(connectMsg);
+        if (mConnState == CONNSTATE.Reconnecting){
+			reconnect();
+		} 
         // we'll get a msg:connected from the Meteor server w/ a session ID when we connect
         // note that this may return an error that the DDP protocol isn't correct
     }
 
+    public String getAuthToken() {
+		return authToken;
+	}
+
+	public void setAuthToken(String authToken) {
+		this.authToken = authToken;
+	}
+    
+    /**
+     * Method to be called on meteor server to initiate a reconnection without relogging in
+     * Must have 'resume' method on meteor server
+     */
+    private void reconnect() {
+    	Object[] params = new Object[1];
+		Map<String, Object> callMsg = new LinkedHashMap<String, Object>();
+		callMsg.put("resume", authToken);
+		params[0] = callMsg;
+	}
+    
     /**
      * Called when connection is closed
      * 
@@ -258,6 +304,10 @@ public class DDPClient extends Observable {
                 + "\",\"reason\":\"" + reason + "\",\"remote\":" + remote + "}";
         log.debug("{}", closeMsg);
         received(closeMsg);
+        
+        if(isReconnectOnDc()){
+        	connect();
+        }
     }
 
     /**
@@ -538,8 +588,11 @@ public class DDPClient extends Observable {
     public void send(Map<String, Object> msgParams) {
         String json = mGson.toJson(msgParams);
         /*System.out.println*/log.debug("Sending {}", json);
+        if(!isWebSocketConnectionOpened){
+        	pendingMessageQueue.add(json);
+        }
         try {
-        this.mWsClient.send(json);
+        	this.mWsClient.send(json);
         } catch (WebsocketNotConnectedException ex) {
             handleError(ex);
             mConnState = CONNSTATE.Closed;
@@ -608,6 +661,11 @@ public class DDPClient extends Observable {
             }
         } else if (msgtype.equals(DdpMessageType.CONNECTED)) {
             mConnState = CONNSTATE.Connected;
+            String jsonMsg = "";
+            // Send out all pending messages in the queue
+            while ((jsonMsg = pendingMessageQueue.poll()) != null) {
+                sendPendingMessages(jsonMsg);
+             }
         } else if (msgtype.equals(DdpMessageType.CLOSED)) {
             mConnState = CONNSTATE.Closed;
         } else if (msgtype.equals(DdpMessageType.PING)) {
