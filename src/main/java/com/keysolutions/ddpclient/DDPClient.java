@@ -588,12 +588,10 @@ public class DDPClient extends Observable {
     public void send(Map<String, Object> msgParams) {
         String json = mGson.toJson(msgParams);
         /*System.out.println*/log.debug("Sending {}", json);
-        if(!isWebSocketConnectionOpened){
-        	pendingMessageQueue.add(json);
-        }
         try {
         	this.mWsClient.send(json);
         } catch (WebsocketNotConnectedException ex) {
+        	pendingMessageQueue.add(json);
             handleError(ex);
             mConnState = CONNSTATE.Closed;
         }
