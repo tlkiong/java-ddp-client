@@ -429,7 +429,9 @@ public class DDPClient extends Observable {
         Map<String, Object> subMsg = new HashMap<String, Object>();
         subMsg.put(DdpMessageField.MSG, DdpMessageType.SUB);
         subMsg.put(DdpMessageField.NAME, name);
-        subMsg.put(DdpMessageField.PARAMS, params);
+        if(params != null){
+        	subMsg.put(DdpMessageField.PARAMS, params);
+        }
 
         int id = addCommmand(resultListener/*
                                             * "sub,"+name+","+Arrays.toString(params
