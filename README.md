@@ -15,6 +15,12 @@ Differences include:
 * Handle resend message for reconnection
 * Must have an error listener to listens for all errors
 
+Take Note
+-----
+* Meteor server disconnect and have to "Relogin". Might have weird response
+* Since there is reconnection, there might appear a case where the server DC and then the client will reconnect and then server DC again.
+** Thus, there will be a loop on the DC -> RC which WILL consume resources and hang the application
+
 To-Do
 -----
 * Update the current code
