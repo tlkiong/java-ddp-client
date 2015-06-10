@@ -32,10 +32,15 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
 
+import main.common.meteorDdpClient.DDPListener;
 import main.common.meteorDdpClient.UserAuthenticator;
 import main.common.meteorDdpClient.DDPClient.CONNSTATE;
+import main.common.meteorDdpClient.DDPClient.DdpMessageField;
+import main.common.meteorDdpClient.DDPClient.DdpMessageType;
+import main.common.meteorDdpClient.DDPClient.MSGTYPE;
 
 import org.java_websocket.WebSocket.READYSTATE;
 import org.java_websocket.client.DefaultSSLWebSocketClientFactory;
@@ -50,7 +55,7 @@ import com.google.gson.Gson;
  * @author kenyee
  */
 public class DDPClient extends Observable {
-    private final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(this.getClass());
+	private final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(this.getClass());
 
     /** Field names supported in the DDP protocol */
     public class DdpMessageField {
@@ -106,12 +111,22 @@ public class DDPClient extends Observable {
         Disconnected,
         Connected,
         Closed,
-        Reconnecting,
+        Reconnecting
+    };
+    
+    public enum MSGTYPE {
+    	PING,
+    	SUBSCRIPTION,
+    	PONG,
+    	CALL,
+    	CONNECT,
+    	UNSUBSCRIBE,
+    	RESUME
     };
     private CONNSTATE mConnState;
     /** current command ID */
     private int mCurrentId;
-    /** callback tracking for DDP commands */
+    /** Listeners for method functions */
     private Map<String, DDPListener> mMsgListeners;
     /** web socket client */
     private WebSocketClient mWsClient;
@@ -121,13 +136,19 @@ public class DDPClient extends Observable {
     private boolean mConnectionStarted;
     /** Google GSON object */
     private final Gson mGson = new Gson();
-    /** If true, it will reconnect on each dc detected*/
-    private boolean reconnectOnDc;
-    /** A list of pendingMessages to send out to the Meteor server once connected */
-    Queue<String> pendingMessageQueue = new ConcurrentLinkedQueue<String>();    
-    private boolean isWebSocketConnectionOpened = false;
-    /** AuthToken from meteor once authenticated */
-    private String authToken;
+	private ConcurrentLinkedQueue<String> pendingMsgQueue;
+	private ConcurrentLinkedQueue<String> subscriptionMsg;
+	private DDPListener errorListener;
+	private int reconnectCount;
+	private int reconnectCounter;
+    private  int delayReconnectTime = 10000;//10 seconds default
+    private boolean hasReconnected;
+    private boolean toReconnect;
+	private DefaultSSLWebSocketClientFactory webSocketFactory;
+	private Map<String, Object> loginCallMsg;
+    private Map<String, Object> resumeMsg;
+    private boolean toLogin;
+    
     /**
      * Instantiates a Meteor DDP client for the Meteor server located at the
      * supplied IP and port (note: running Meteor locally will typically have a
@@ -139,10 +160,32 @@ public class DDPClient extends Observable {
      * @param useSSL Whether to use SSL for websocket encryption
      * @throws URISyntaxException URI error
      */
-    public DDPClient(String meteorServerIp, Integer meteorServerPort, boolean useSSL, boolean reconnectOnDc)
-            throws URISyntaxException {
-    	setReconnectOnDc(reconnectOnDc);
+    public DDPClient(String meteorServerIp, Integer meteorServerPort, DDPListener errorListener, int reconnectCount, boolean useSSL)
+            throws Exception {
+    	if(errorListener == null){
+    		throw new Exception("ErrorListener cannot be null"); 
+    	}
+    	this.pendingMsgQueue = new ConcurrentLinkedQueue<String>();
+    	this.subscriptionMsg = new ConcurrentLinkedQueue<String>();
+    	setReconnectCount(reconnectCount);
+    	setErrorListener(errorListener);
         initWebsocket(meteorServerIp, meteorServerPort, useSSL);
+    }
+    
+    /**
+     * Instantiates a Meteor DDP client for the Meteor server located at the
+     * supplied IP and port (note: running Meteor locally will typically have a
+     * port of 3000 but port 80 is the typical default for publicly deployed
+     * servers)
+     * 
+     * @param meteorServerIp IP of Meteor server
+     * @param meteorServerPort Port of Meteor server, if left null it will default to 3000
+     * @param trustManagers Explicitly defined trust managers, if null no SSL encryption would be used.
+     * @throws URISyntaxException URI error
+     */
+    public DDPClient(String meteorServerIp, Integer meteorServerPort, TrustManager[] trustManagers)
+            throws URISyntaxException {
+        initWebsocket(meteorServerIp, meteorServerPort, trustManagers);
     }
     
     /**
@@ -157,21 +200,19 @@ public class DDPClient extends Observable {
      *            - Port of Meteor server, if left null it will default to 3000
      * @throws URISyntaxException URI error
      */
-    public DDPClient(String meteorServerIp, Integer meteorServerPort, boolean reconnectOnDc)
-            throws URISyntaxException {
-    	setReconnectOnDc(reconnectOnDc);
+    public DDPClient(String meteorServerIp, Integer meteorServerPort, DDPListener errorListener, int reconnectCount)
+            throws Exception {
+    	if(errorListener == null){
+    		throw new Exception("ErrorListener cannot be null"); 
+    	}
+    	this.pendingMsgQueue = new ConcurrentLinkedQueue<String>();
+    	this.subscriptionMsg = new ConcurrentLinkedQueue<String>();
+    	setReconnectCount(reconnectCount);
+    	setErrorListener(errorListener);
         initWebsocket(meteorServerIp, meteorServerPort, false);
     }
     
-	public boolean isReconnectOnDc() {
-		return reconnectOnDc;
-	}
-
-	public void setReconnectOnDc(boolean reconnectOnDc) {
-		this.reconnectOnDc = reconnectOnDc;
-	}
-    
-    /**
+	/**
      * Initializes a websocket connection
      * @param meteorServerIp IP address of Meteor server
      * @param meteorServerPort port of Meteor server, if left null it will default to 3000
@@ -180,36 +221,55 @@ public class DDPClient extends Observable {
      */
     private void initWebsocket(String meteorServerIp, Integer meteorServerPort, boolean useSSL)
             throws URISyntaxException {
-        mConnState = CONNSTATE.Disconnected;
-        if (meteorServerPort == null)
-            meteorServerPort = 3000;
-        mMeteorServerAddress = (useSSL ? "wss://" : "ws://")
-                + meteorServerIp + ":"
-                + meteorServerPort.toString() + "/websocket";
-        this.mCurrentId = 0;
-        this.mMsgListeners = new ConcurrentHashMap<String, DDPListener>();
-        createWsClient(mMeteorServerAddress);
-        
+    	TrustManager[] trustManagers = null;
         if (useSSL) {
             try {
                 // set up trustkeystore w/ Java's default trusted 
                 TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
                 KeyStore trustKeystore = null;
                 trustManagerFactory.init(trustKeystore);
-                /* 
-                for (TrustManager trustManager : trustManagerFactory.getTrustManagers()) {
-                    if (trustManager instanceof X509TrustManager) {
-                        X509TrustManager x509TrustManager = (X509TrustManager)trustManager;
-                    }
-                }
-                */
+                trustManagers = trustManagerFactory.getTrustManagers();
+            } catch (KeyStoreException e) {
+            	System.out.println("KeyStoreException");
+            	e.printStackTrace();
+                log.warn("Error accessing Java default cacerts keystore {}", e);
+            } catch (NoSuchAlgorithmException e) {
+            	System.out.println("NoSuchAlgorithmException");
+            	e.printStackTrace();
+                log.warn("Error accessing Java default trustmanager algorithms {}", e);
+            }
+        }
+        initWebsocket(meteorServerIp, meteorServerPort, trustManagers);
+    }
+    
+    /**
+     * Initializes a websocket connection
+     * @param meteorServerIp IP address of Meteor server
+     * @param meteorServerPort port of Meteor server, if left null it will default to 3000
+     * @param trustManagers array explicitly defined trust managers, can be null
+     * @throws URISyntaxException
+     */
+    private void initWebsocket(String meteorServerIp, Integer meteorServerPort, TrustManager[] trustManagers)
+            throws URISyntaxException {
+        mConnState = CONNSTATE.Disconnected;
+        if (meteorServerPort == null)
+            meteorServerPort = 3000;
+        mMeteorServerAddress = (trustManagers != null ? "wss://" : "ws://")
+                + meteorServerIp + ":"
+                + meteorServerPort.toString() + "/websocket";
+        this.mCurrentId = 0;
+        this.mMsgListeners = new ConcurrentHashMap<String, DDPListener>();
+        createWsClient(mMeteorServerAddress);
+        
+        if (trustManagers != null) {
+            try {
                 SSLContext sslContext = null;
                 sslContext = SSLContext.getInstance( "TLS" );
-                sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
+                sslContext.init(null, trustManagers, null);
                 // now we can set the web service client to use this SSL context
-                mWsClient.setWebSocketFactory( new DefaultSSLWebSocketClientFactory( sslContext ) );
-            } catch (KeyStoreException e) {
-                log.warn("Error accessing Java default cacerts keystore {}", e);
+                
+                this.webSocketFactory = new DefaultSSLWebSocketClientFactory( sslContext );
+                mWsClient.setWebSocketFactory( this.webSocketFactory );
             } catch (NoSuchAlgorithmException e) {
                 log.warn("Error accessing Java default trustmanager algorithms {}", e);
             } catch (KeyManagementException e) {
@@ -247,6 +307,10 @@ public class DDPClient extends Observable {
                 connectionClosed(code, reason, remote);
             }
         };
+        
+        if(this.webSocketFactory!=null){
+        	this.mWsClient.setWebSocketFactory( this.webSocketFactory );
+        }
         mConnectionStarted = false;
     }
 
@@ -256,7 +320,7 @@ public class DDPClient extends Observable {
      */
     private void connectionOpened() {
         log.trace("WebSocket connection opened");
-        isWebSocketConnectionOpened = true;
+        System.out.println("WebSocket connection opened");
         // reply to Meteor server with connection confirmation message ({"msg":
         // "connect"})
         Map<String, Object> connectMsg = new HashMap<String, Object>();
@@ -264,33 +328,11 @@ public class DDPClient extends Observable {
         connectMsg.put(DdpMessageField.VERSION, DDP_PROTOCOL_VERSION);
         connectMsg.put(DdpMessageField.SUPPORT,
                 new String[] { DDP_PROTOCOL_VERSION });
-        send(connectMsg);
-        if (mConnState == CONNSTATE.Reconnecting){
-			reconnect();
-		} 
+        send(connectMsg, MSGTYPE.CONNECT);
         // we'll get a msg:connected from the Meteor server w/ a session ID when we connect
         // note that this may return an error that the DDP protocol isn't correct
     }
 
-    public String getAuthToken() {
-		return authToken;
-	}
-
-	public void setAuthToken(String authToken) {
-		this.authToken = authToken;
-	}
-    
-    /**
-     * Method to be called on meteor server to initiate a reconnection without relogging in
-     * Must have 'resume' method on meteor server
-     */
-    private void reconnect() {
-    	Object[] params = new Object[1];
-		Map<String, Object> callMsg = new LinkedHashMap<String, Object>();
-		callMsg.put("resume", authToken);
-		params[0] = callMsg;
-	}
-    
     /**
      * Called when connection is closed
      * 
@@ -304,9 +346,24 @@ public class DDPClient extends Observable {
                 + "\",\"reason\":\"" + reason + "\",\"remote\":" + remote + "}";
         log.debug("{}", closeMsg);
         received(closeMsg);
-        
-        if(isReconnectOnDc()){
-        	connect();
+        //TODO: handle the reconnection here
+        if((getReconnectCounter()>0)&&(isToReconnect())){
+        	try {
+				Thread.sleep(10000);
+			} catch (InterruptedException e1) {
+				e1.printStackTrace();
+			}
+        	//Do not delay the first time trying to reconnect
+        	if(getReconnectCounter()<getReconnectCount()){
+        		try {
+    				Thread.sleep(getDelayReconnectTime());
+    			} catch (InterruptedException e) {
+    				e.printStackTrace();
+    			}
+        	}
+        	System.out.println("connectionClosed reconnectCounter: "+getReconnectCounter());//TODO
+        	reconnect();
+        	minusReconnectCounter();
         }
     }
 
@@ -352,23 +409,44 @@ public class DDPClient extends Observable {
         }
         return id;
     }
+    
+    /**
+    * Registers a client DDP command results callback listener
+    * 
+    * @param DDP command results callback
+    * @return ID for next command
+    */
+   private String addSubscribeCommmand(String collectionName, DDPListener resultListener) {
+       String id = collectionName;
+       if (resultListener != null) {
+           // store listener for callbacks
+           mMsgListeners.put(id, resultListener);
+       }
+       return id;
+   }
 
     /**
      * Initiate connection to meteor server
      */
-    public void connect() {
-        if (this.mWsClient.getReadyState() == READYSTATE.CLOSED) {
+    public void connect() {//TODO
+        if ((this.mWsClient.getReadyState() == READYSTATE.CLOSED)||(this.mWsClient.getReadyState() == READYSTATE.CLOSING)) {
             // we need to create a new wsClient because a closed websocket cannot be reused
             try {
+            	System.out.println("\t ~~ Create new websocket");
                 createWsClient(mMeteorServerAddress);
             } catch (URISyntaxException e) {
                 // we shouldn't get URI exceptions because the address was validated in initWebsocket
+            	e.printStackTrace();
             }
+        } else {
+        	System.out.println("mWsClient.getReadyState(): "+this.mWsClient.getReadyState());
         }
         if (!mConnectionStarted) {
             // only do the connect if no connection attempt has been done for this websocket client
             this.mWsClient.connect();
             mConnectionStarted = true;
+        } else {
+        	System.out.println("ConnectionStarted: "+mConnectionStarted);
         }
     }
     
@@ -376,8 +454,10 @@ public class DDPClient extends Observable {
      * Closes an open websocket connection.
      * This is async, so you'll get a close notification callback when it eventually closes.
      */
-    public void disconnect() {
-        if (this.mWsClient.getReadyState() == READYSTATE.OPEN) {
+    public void disconnect(boolean toReconnect) {
+    	setToReconnect(toReconnect);
+        if (this.mWsClient.getReadyState() != READYSTATE.CLOSED) {
+        	System.out.println("\t ~~ Close websocket");
             this.mWsClient.close();
         }
     }
@@ -391,6 +471,9 @@ public class DDPClient extends Observable {
      * @return ID for next command
      */
     public int call(String method, Object[] params, DDPListener resultListener) {
+    	if(isToReconnect()){
+    		resetReconnectCounter();
+    	}
         Map<String, Object> callMsg = new HashMap<String, Object>();
         callMsg.put(DdpMessageField.MSG, DdpMessageType.METHOD);
         callMsg.put(DdpMessageField.METHOD, method);
@@ -401,11 +484,34 @@ public class DDPClient extends Observable {
                                             * (params)
                                             */);
         callMsg.put(DdpMessageField.ID, Integer.toString(id));
-        send(callMsg);
+        if(method.equalsIgnoreCase("login")){
+        	setLoginCallMsg(callMsg);
+        }
+        send(callMsg, MSGTYPE.CALL);
         return id;
     }
+    
+    private void setToLogin(boolean toLogin) {
+		this.toLogin = toLogin;
+	}
+    
+    private boolean getToLogin(){
+    	return this.toLogin;
+    }
 
-    /**
+	private void setLoginCallMsg(Map<String, Object> loginCallMsg) {
+    	this.loginCallMsg = loginCallMsg;
+	}
+    
+    private Map<String, Object> getLoginCallMsg(){
+    	return this.loginCallMsg;
+    }
+    
+    public void loginCall() {
+        send(this.loginCallMsg, MSGTYPE.CALL);
+    }
+    
+	/**
      * Call a meteor method with the supplied parameters
      * 
      * @param method name of corresponding Meteor method
@@ -424,21 +530,17 @@ public class DDPClient extends Observable {
      * @param resultListener DDP command listener for this call
      * @return ID for next command
      */
-    public int subscribe(String name, Object[] params,
+    public String subscribe(String name, Object[] params,
             DDPListener resultListener) {
         Map<String, Object> subMsg = new HashMap<String, Object>();
         subMsg.put(DdpMessageField.MSG, DdpMessageType.SUB);
         subMsg.put(DdpMessageField.NAME, name);
-        if(params != null){
-        	subMsg.put(DdpMessageField.PARAMS, params);
-        }
-
-        int id = addCommmand(resultListener/*
-                                            * "sub,"+name+","+Arrays.toString(params
-                                            * )
-                                            */);
-        subMsg.put(DdpMessageField.ID, Integer.toString(id));
-        send(subMsg);
+        subMsg.put(DdpMessageField.PARAMS, params);
+        
+        String id = addSubscribeCommmand(name,resultListener);
+        
+        subMsg.put(DdpMessageField.ID, id);
+        send(subMsg,MSGTYPE.SUBSCRIPTION);
         return id;
     }
 
@@ -449,7 +551,7 @@ public class DDPClient extends Observable {
      * @param params arguments corresponding to the Meteor subscription
      * @return ID for next command
      */
-    public int subscribe(String name, Object[] params) {
+    public String subscribe(String name, Object[] params) {
         return subscribe(name, params, null);
     }
 
@@ -467,7 +569,7 @@ public class DDPClient extends Observable {
 
         int id = addCommmand(resultListener/* "unsub,"+name */);
         unsubMsg.put(DdpMessageField.ID, Integer.toString(id));
-        send(unsubMsg);
+        send(unsubMsg, MSGTYPE.UNSUBSCRIBE);
         return id;
     }
 
@@ -480,7 +582,7 @@ public class DDPClient extends Observable {
     public int unsubscribe(String name) {
         return unsubscribe(name, null);
     }
-
+    
     /**
      * Inserts document into collection from the client
      * 
@@ -575,7 +677,7 @@ public class DDPClient extends Observable {
         if (pingId != null) {
             pingMsg.put(DdpMessageField.ID, pingId);
         }
-        send(pingMsg);
+        send(pingMsg,MSGTYPE.PING);
         if (resultListener != null) {
             // store listener for callbacks
             mMsgListeners.put(pingId, resultListener);
@@ -587,15 +689,31 @@ public class DDPClient extends Observable {
      * 
      * @param msgParams parameters for DDP msg
      */
-    public void send(Map<String, Object> msgParams) {
+    public void send(Map<String, Object> msgParams,MSGTYPE type) {
         String json = mGson.toJson(msgParams);
         /*System.out.println*/log.debug("Sending {}", json);
+        System.out.println("\t +++++++++ Sending {}"+ json);
+        if(((type == MSGTYPE.SUBSCRIPTION)||(type == MSGTYPE.RESUME))&&(!subscriptionMsg.contains(json))){
+        	System.out.println("\t +++++++++ Inside Sending {}"+ json + " type: "+type);
+    		subscriptionMsg.add(json);
+    	}
+        
         try {
+        	System.out.println("\tsend: "+json);
+        	System.out.println("\t ~~ mWsClient.getReadyState(): "+mWsClient.getReadyState());
+        	if((mWsClient.getReadyState()!= READYSTATE.OPEN)&&(!this.pendingMsgQueue.contains(json))){
+        		this.pendingMsgQueue.add(json);
+        	}
+        	
         	this.mWsClient.send(json);
         } catch (WebsocketNotConnectedException ex) {
-        	pendingMessageQueue.add(json);
+        	if(!this.pendingMsgQueue.contains(json)){
+        		this.pendingMsgQueue.add(json);
+        	}
             handleError(ex);
-            mConnState = CONNSTATE.Closed;
+            if(getState()!=CONNSTATE.Closed){
+            	mConnState = CONNSTATE.Closed;
+            }
         }
     }
 
@@ -608,6 +726,8 @@ public class DDPClient extends Observable {
     @SuppressWarnings("unchecked")
     public void received(String msg) {
          /*System.out.println*/log.debug("Received response: {}", msg);
+         System.out.println("Received response: {}" + msg);//TODO
+         
         this.setChanged();
         // generic object deserialization is from
         // http://programmerbruce.blogspot.com/2011/06/gson-v-jackson.html
@@ -644,6 +764,7 @@ public class DDPClient extends Observable {
             String msgId = (String) jsonFields.get(DdpMessageField.ID
                     .toString());
             DDPListener listener = (DDPListener) mMsgListeners.get(msgId);
+            mMsgListeners.remove(msgId);
             if (listener != null) {
                 listener.onNoSub(msgId, (Map<String, Object>) jsonFields
                         .get(DdpMessageField.ERROR));
@@ -659,16 +780,61 @@ public class DDPClient extends Observable {
                     mMsgListeners.remove(msgId);
                 }
             }
+            
+            Map<String, Object> msgErrorMap = (Map<String, Object>) jsonFields.get(DdpMessageField.ERROR);
+
+            if(msgErrorMap!=null){
+            	String msgErrorReason = (String) msgErrorMap.get(DdpMessageField.REASON);
+            	if(msgErrorReason!=null && !msgErrorReason.isEmpty()){
+            		if(msgErrorReason.contains("Please log in again")){
+            			//Login again
+            			if(getLoginCallMsg()!=null && !getLoginCallMsg().isEmpty()){
+            				System.out.println("\t ~~~~~~~~~~~~~ logincall!! ~~~~~~~~~~~~");
+            				setToLogin(true);
+            			}
+            		}
+            	}
+            }
+            
         } else if (msgtype.equals(DdpMessageType.CONNECTED)) {
             mConnState = CONNSTATE.Connected;
-            String jsonMsg = "";
-            // Send out all pending messages in the queue
-            while ((jsonMsg = pendingMessageQueue.poll()) != null) {
-                sendPendingMessages(jsonMsg);
-             }
+            sendPendingMsg();//TODO
+            resetReconnectCounter();
+            if((getReconnectCount()>0)&&(isToReconnect())){
+            	setHasReconnected(true);
+            	if(getToLogin()){
+            		loginCall();
+            		setToLogin(false);
+            		System.out.println("\t\t ~~~~~~~~~ gettologin?");
+            	} else {
+            		if(getResumeMsg()!=null) {
+                		this.resume();
+                		System.out.println("\t\t ~~~~~~~~~ this.resume()?");
+                	}
+            	}
+            	resubscribe();
+            }
         } else if (msgtype.equals(DdpMessageType.CLOSED)) {
-            mConnState = CONNSTATE.Closed;
+        	System.out.println("\t\tmeteor server is down || connstate: "+mConnState);
+        	mConnState = CONNSTATE.Closed;
+        	if(getErrorListener()!=null){
+        		errorListener.onResult(jsonFields);
+        	}
+        	
+        	System.out.println("closed, getReconnectCounter(): "+getReconnectCounter()+" :isToReconnect(): "+isToReconnect());
+        	
+        	if((getReconnectCounter()>0)&&(isToReconnect())){
+            	//Only reconnect on first time
+        		System.out.println("reconnectCounter: "+getReconnectCounter());//TODO
+            	if(getReconnectCounter()==getReconnectCount()){
+            		System.out.println("reconnectCounter in : "+getReconnectCounter());//TODO
+                	reconnect();
+                	minusReconnectCounter();
+            	}
+            	
+            }
         } else if (msgtype.equals(DdpMessageType.PING)) {
+        	//PING sent by server
             String pingId = (String) jsonFields.get(DdpMessageField.ID
                     .toString());
             // automatically send PONG command back to server
@@ -677,23 +843,206 @@ public class DDPClient extends Observable {
             if (pingId != null) {
                 pongMsg.put(DdpMessageField.ID, pingId);
             }
-            send(pongMsg);
+            send(pongMsg,MSGTYPE.PONG);
         } else if (msgtype.equals(DdpMessageType.PONG)) {
+        	//PONG send by server
             String pingId = (String) jsonFields.get(DdpMessageField.ID
                     .toString());
             // let listeners know a Pong happened
             DDPListener listener = (DDPListener) mMsgListeners.get(pingId);
+            mMsgListeners.remove(pingId);
             if (listener != null) {
                 listener.onPong(pingId);
-                mMsgListeners.remove(pingId);
+                //mMsgListeners.remove(pingId);
             }
-        }
+        } else if (msgtype.equals(DdpMessageType.CHANGED)) { //TODO
+			System.out.println("\t changed: " + msgtype);
+			String subscribeListenerId = (String) jsonFields.get(DdpMessageField.COLLECTION.toString());
+			if (subscribeListenerId != null) {
+				System.out.println("\t msgId: " + subscribeListenerId);
+				DDPListener subscribeListener = (DDPListener) mMsgListeners.get(subscribeListenerId);
+				System.out.println("\t listener out: " + subscribeListener);
+				if (subscribeListener != null) {
+					System.out.println("\t listener in: " + subscribeListener);
+					System.out.println("\t jsonFields: " + jsonFields);
+					subscribeListener.onChanged(jsonFields);
+				}
+			}
+		} else if (msgtype.equals(DdpMessageType.ADDED)) { //TODO
+			System.out.println("\t added: " + msgtype);
+			String subscribeListenerId = (String) jsonFields.get(DdpMessageField.COLLECTION.toString());
+			if (subscribeListenerId != null) {
+				System.out.println("\t msgId: " + subscribeListenerId);
+				DDPListener subscribeListener = (DDPListener) mMsgListeners.get(subscribeListenerId);
+				System.out.println("\t listener out: " + subscribeListener);
+				if (subscribeListener != null) {
+					System.out.println("\t listener in: " + subscribeListener);
+					System.out.println("\t jsonFields: " + jsonFields);
+					subscribeListener.onResult(jsonFields);
+				}
+			}
+		} else if (msgtype.equals(DdpMessageType.ERROR)) { // Receive this
+															// message when
+															// there is no
+															// connection to the
+															// meteor server
+			System.out.println("\t\t Received error || connstate: "+mConnState);
+			if(getErrorListener()!=null){
+        		errorListener.onResult(jsonFields);
+        	}
+//			if(mConnState != CONNSTATE.Connected){
+//				if((getReconnectCounter()>0)&&(isToReconnect())){
+//	            	//Only reconnect on first time
+//	        		System.out.println("ERROR reconnectCounter: "+getReconnectCounter());//TODO
+//	            	if(getReconnectCounter()==getReconnectCount()){
+//	            		System.out.println("reconnectCounter in : "+getReconnectCounter());//TODO
+//	                	reconnect();
+//	                	minusReconnectCounter();
+//	            	}
+//	            	
+//	            }
+//			}
+		}
     }
+    
+    private void reconnect() {
+    	System.out.println("\t ~~~~~~~ Come into reconnect ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    	disconnect(true);
+    	connect();
+    }
+    
+    public void sendPendingMsg(){
+    	String pendingMsg;
+		// Send out all pending messages in the queue
+		while ((pendingMsg = this.pendingMsgQueue.poll()) != null) {
+			this.mWsClient.send(pendingMsg);
+			System.out.println("~~ Send Pending Messages: " + pendingMsg);
+		}
+    }
+    
+    public void resubscribe(){
+    	for(String msg : subscriptionMsg){
+    		System.out.println("  Resubscribing: "+msg);
+    		this.mWsClient.send(msg);
+    	}
+    }
+    
+    public void setResumeMsg(String username, String authToken, String macAddress) {
+    	Object[] params = new Object[2];
+		Map<String, Object> userInformation = new LinkedHashMap<String, Object>();
+		userInformation.put("resume", authToken);
+		Map<String, Object> userUsername = new HashMap<String, Object>();
+		userUsername.put("username", username);
+		userInformation.put("user", userUsername);
+		// machine id
+		Map<String, Object> userMacAddress = new HashMap<String, Object>();
+		userMacAddress.put("machineId", macAddress);
+		params[0] = userInformation;
+		params[1] = userMacAddress;
 
-    /**
+		resumeMsg = this.resumeMsg("login", params, null);
+    }
+    
+    public Map<String, Object> getResumeMsg() {
+		return resumeMsg;
+	}
+
+	/**
+     * Call a meteor method with the supplied parameters
+     * 
+     * @param method name of corresponding Meteor method
+     * @param params arguments to be passed to the Meteor method
+     * @param resultListener DDP command listener for this method call
+     * @return ID for next command
+     */
+    public Map<String, Object> resumeMsg(String method, Object[] params, DDPListener resultListener) {
+        Map<String, Object> resumeMsg = new HashMap<String, Object>();
+        resumeMsg.put(DdpMessageField.MSG, DdpMessageType.METHOD);
+        //TODO: Try out with social media login
+        resumeMsg.put(DdpMessageField.METHOD, "login");
+        resumeMsg.put(DdpMessageField.PARAMS, params);
+        
+        int id = addCommmand(resultListener/*
+                                            * "method,"+method+","+Arrays.toString
+                                            * (params)
+                                            */);
+        resumeMsg.put(DdpMessageField.ID, Integer.toString(id));
+        return resumeMsg;
+    }
+    
+    public void resume(){
+    	send(this.getResumeMsg(), MSGTYPE.RESUME);
+    }
+    
+	/**
      * @return current DDP connection state (disconnected/connected/closed)
      */
     public CONNSTATE getState() {
         return mConnState;
     }
+
+	public DDPListener getErrorListener() {
+		return errorListener;
+	}
+
+	public void setErrorListener(DDPListener errorListener) {
+		this.errorListener = errorListener;
+	}
+
+	public int getReconnectCount() {
+		return reconnectCount;
+	}
+
+	public void setReconnectCount(int reconnectCount) {
+		this.reconnectCount = reconnectCount;
+		//If count is 0 or less, it means it will not reconnnect
+		if(reconnectCount >0){
+			setReconnectCounter(reconnectCount);
+			setHasReconnected(false);
+			setToReconnect(true);
+		}
+	}
+
+	
+	public int getReconnectCounter() {
+		return reconnectCounter;
+	}
+	
+
+	public void setReconnectCounter(int reconnectCounter) {
+		this.reconnectCounter = reconnectCounter;
+	}
+	
+	public void minusReconnectCounter(){
+		setReconnectCounter(getReconnectCounter()-1);
+	}
+	
+	public void resetReconnectCounter(){
+		setReconnectCounter(getReconnectCount());
+	}
+	
+
+	public int getDelayReconnectTime() {
+		return delayReconnectTime;
+	}
+
+	public void setDelayReconnectTime(int delayReconnectTime) {
+		this.delayReconnectTime = delayReconnectTime;
+	}
+
+	public boolean isHasReconnected() {
+		return hasReconnected;
+	}
+
+	public void setHasReconnected(boolean hasReconnected) {
+		this.hasReconnected = hasReconnected;
+	}
+
+	public boolean isToReconnect() {
+		return toReconnect;
+	}
+
+	public void setToReconnect(boolean toReconnect) {
+		this.toReconnect = toReconnect;
+	}
 }
